@@ -1,0 +1,15 @@
+requests
+pysqlite3-binary
+gunicorn
+# Telegram Bot Dependencies
+pyrogram>=2.0.0
+TgCrypto>=1.2.0
+
+# Web Server for Render
+flask>=2.0.0
+
+# Environment Variables
+python-dotenv>=1.0.0
+
+# Optional but recommended
+aiohttp>=3.8.0

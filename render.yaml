@@ -1,0 +1,16 @@
+services:
+  - type: worker
+    name: telegram-publisher-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python telegram_publisher_bot_fixed.py
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: SUPER_ADMIN_ID
+        sync: false
+    plan: free
