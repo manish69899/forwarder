@@ -13,3 +13,4 @@ python-dotenv>=1.0.0
 
 # Optional but recommended
 aiohttp>=3.8.0
+psutil

@@ -32,6 +32,16 @@ Usage:
 """
 
 import asyncio
+
+# Pyrogram import karne se PEHLE ye loop set karein
+try:
+    loop = asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+# Ab Pyrogram import karein
+from pyrogram import Client, filters, idle, enums
 import logging
 from logging.handlers import RotatingFileHandler
 import sqlite3
@@ -876,56 +886,99 @@ async def worker_engine():
                 msg_queue.task_done()
 
 
-# ==============================================================================
-#                           AUTO-BACKUP SYSTEM
-# ==============================================================================
+import asyncio
+import os
+import shutil
+import sqlite3
+import zipfile
+import psutil  # Server stats ke liye (pip install psutil)
+from datetime import datetime
+
+# --- CONFIGURATION ---
+BACKUP_INTERVAL_DAYS = 10 
+# 10 din ko seconds mein convert kiya: (10 din * 24 ghante * 3600 seconds)
+BACKUP_SECONDS = BACKUP_INTERVAL_DAYS * 24 * 3600 
+MAX_LOG_SIZE = 10 * 1024 * 1024  # 10 MB tak badha diya
+
+async def get_system_stats():
+    """Server ki health report nikalne ke liye."""
+    cpu_usage = psutil.cpu_percent()
+    ram = psutil.virtual_memory()
+    disk = shutil.disk_usage("/")
+    
+    stats_text = (
+        f"📊 **System Health Report**\n"
+        f"🖥 CPU Usage: `{cpu_usage}%`\n"
+        f"🧠 RAM: `{ram.percent}%` ({ram.used // (1024**2)}MB / {ram.total // (1024**2)}MB)\n"
+        f"💾 Disk Free: `{disk.free // (1024**3)}GB` / `{disk.total // (1024**3)}GB`"
+    )
+    return stats_text
 
 async def auto_backup_task(app):
-    """Sends Database Backup to Super Admin every 1 Hour + Cleanup."""
-    logger.info("💾 Auto-Backup & Cleanup System Started...")
+    """Har 10 din mein Compressed Backup aur Server Health check."""
+    logger.info(f"🚀 10-Day Backup System Started. Interval: {BACKUP_INTERVAL_DAYS} Days.")
     
     while True:
         try:
-            await asyncio.sleep(3600)  # 1 Hour
+            # Loop ke shuru mein wait karein (Wait for 10 Days)
+            await asyncio.sleep(BACKUP_SECONDS)
             
-            # DATABASE BACKUP
-            if os.path.exists(DB_NAME) and os.path.getsize(DB_NAME) > 0:
-                caption = (
-                    f"🗄 **System Backup**\n"
-                    f"📅 Date: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
-                    f"ℹ️ **Restore:** Reply with `/restore`"
-                )
+            timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            backup_db = f"backup_{timestamp}.db"
+            zip_name = f"System_Backup_{timestamp}.zip"
+
+            # 1. SAFE SQLITE BACKUP (Lock-free)
+            if os.path.exists(DB_NAME):
+                # Pehle local copy banayein safely
+                src = sqlite3.connect(DB_NAME)
+                dst = sqlite3.connect(backup_db)
+                with dst:
+                    src.backup(dst)
+                src.close()
+                dst.close()
+
+                # 2. COMPRESSION (File size chota karne ke liye)
+                with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    zipf.write(backup_db)
                 
+                # Health stats fetch karein
+                health_stats = await get_system_stats()
+                
+                caption = (
+                    f"📦 **Scheduled 10-Day Backup**\n"
+                    f"📅 Date: `{datetime.now().strftime('%Y-%m-%d')}`\n\n"
+                    f"{health_stats}\n\n"
+                    f"ℹ️ Restore karne ke liye zip se `.db` nikal kar `/restore` karein."
+                )
+
+                # Send to Admin
                 await app.send_document(
                     chat_id=SUPER_ADMIN_ID,
-                    document=DB_NAME,
+                    document=zip_name,
                     caption=caption
                 )
-                logger.info("✅ Database Backup sent to Super Admin.")
+                logger.info("✅ 10-Day Backup & Stats sent to Admin.")
 
-            # STORAGE CLEANUP
+                # Cleanup temporary files
+                if os.path.exists(backup_db): os.remove(backup_db)
+                if os.path.exists(zip_name): os.remove(zip_name)
+
+            # 3. SMART CLEANUP (Downloads folder)
             if os.path.exists("downloads"):
-                for filename in os.listdir("downloads"):
-                    file_path = os.path.join("downloads", filename)
-                    try:
-                        if os.path.isfile(file_path) or os.path.islink(file_path):
-                            os.unlink(file_path)
-                        elif os.path.isdir(file_path):
-                            shutil.rmtree(file_path)
-                    except Exception as e:
-                        logger.error(f"⚠️ Cleanup Error: {e}")
-                logger.info("🧹 Downloads folder cleaned.")
+                # Purge in background thread
+                await asyncio.to_thread(shutil.rmtree, "downloads")
+                os.makedirs("downloads")
+                logger.info("🧹 Downloads cleared.")
 
-            # Truncate Logs if too big
-            if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 5 * 1024 * 1024:
+            # 4. LOG ROTATION
+            if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > MAX_LOG_SIZE:
                 with open(LOG_FILE, "w") as f:
-                    f.truncate(0)
-                logger.info("🧹 System Log truncated.")
+                    f.write(f"--- Log reset at {datetime.now()} ---\n")
+                logger.info("🧹 Large Log truncated.")
 
         except Exception as e:
-            logger.error(f"❌ Backup/Cleanup Failed: {e}")
-            await asyncio.sleep(60)
-
+            logger.error(f"❌ Backup Loop Error: {e}")
+            await asyncio.sleep(600) # Agar error aaye toh 10 min baad retry karein
 
 # ==============================================================================
 #                           CALLBACK HANDLERS (FIXED)
@@ -1404,27 +1457,98 @@ async def logs_handler(client: Client, message: Message):
         await message.reply("⚠️ Log file is empty or missing.")
 
 
-@app.on_message(filters.command("restore") & filters.private)
-async def restore_handler(client: Client, message: Message):
-    """Restores the database from a backup file."""
-    if message.from_user.id != SUPER_ADMIN_ID: return
-
-    if not message.reply_to_message or not message.reply_to_message.document:
-        await message.reply("⚠️ **Usage:** Reply to a `.db` backup with `/restore`.")
-        return
+@app.on_message(filters.command("backup") & filters.user(SUPER_ADMIN_ID))
+async def manual_backup(client, message):
+    """Manually triggers a safe compressed backup."""
+    status = await message.reply("⚡ **Generating Secure Backup...**")
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_db = f"manual_backup_{timestamp}.db"
+    zip_name = f"Backup_{timestamp}.zip"
 
     try:
-        status = await message.reply("⏳ **Restoring Database...**")
-        await message.reply_to_message.download(file_name=DB_NAME)
-        db.connect() 
-        await status.edit("✅ **Restore Complete!**")
+        # 1. Safe SQLite Copy (No Locking)
+        src = sqlite3.connect(DB_NAME)
+        dst = sqlite3.connect(backup_db)
+        with dst:
+            src.backup(dst)
+        src.close()
+        dst.close()
+
+        # 2. Compress it
+        with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            zipf.write(backup_db)
+
+        # 3. Send to Admin
+        await message.reply_document(
+            document=zip_name,
+            caption=f"✅ **Manual Backup Successful**\n📅 `{datetime.now()}`\n📂 `{zip_name}`"
+        )
+        await status.delete()
+
     except Exception as e:
-        await message.reply(f"❌ Restore Failed: {e}")
+        await status.edit(f"❌ **Backup Failed:** `{e}`")
+    finally:
+        # Cleanup temp files
+        if os.path.exists(backup_db): os.remove(backup_db)
+        if os.path.exists(zip_name): os.remove(zip_name)
 
+@app.on_message(filters.command("restore") & filters.user(SUPER_ADMIN_ID))
+async def restore_handler(client: Client, message: Message):
+    if not message.reply_to_message or not message.reply_to_message.document:
+        return await message.reply("⚠️ **Usage:** Reply to a backup file with `/restore`.")
 
+    status = await message.reply("⏳ **Restoring and Rebooting...**")
+
+    try:
+        # 1. Download Backup
+        path = await message.reply_to_message.download()
+        
+        # 2. Extract if ZIP, otherwise Move
+        if path.endswith(".zip"):
+            with zipfile.ZipFile(path, 'r') as zip_ref:
+                db_files = [f for f in zip_ref.namelist() if f.endswith('.db')]
+                if db_files:
+                    zip_ref.extract(db_files[0], path=".")
+                    os.replace(db_files[0], DB_NAME)
+                else:
+                    raise Exception("No .db found in ZIP!")
+        else:
+            os.replace(path, DB_NAME)
+
+        # 3. Final Success Message & Restart
+        await status.edit("✅ **Database Restored!**\n🔄 *Bot is restarting to apply changes...*")
+        
+        # Thoda delay taaki message send ho jaye
+        await asyncio.sleep(2)
+        await restart_bot()
+
+    except Exception as e:
+        await status.edit(f"❌ **Restore Failed:** `{e}`")
+        if os.path.exists(path): os.remove(path)
 # ==============================================================================
 #                           MAIN EXECUTOR
 # ==============================================================================
+import sys
+
+async def restart_bot():
+    """Bot ko safely restart karne ke liye."""
+    # Sabse pehle connections close karein (DB, Client etc.)
+    try:
+        if db.is_closed() == False:
+            db.close()
+    except:
+        pass
+        
+    # Python script ko dobara execute karein
+    os.execl(sys.executable, sys.executable, *sys.argv)
+
+@app.on_message(filters.command("restart") & filters.user(SUPER_ADMIN_ID))
+async def manual_restart(client, message):
+    await message.reply("🛰 **System Reboot Initiated...**\nSee you in 5 seconds!")
+    await asyncio.sleep(1)
+    await restart_bot()
+
 
 async def main():
     """Starts the Enterprise Bot System."""
